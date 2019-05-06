@@ -1,0 +1,142 @@
+#!/usr/bin/env python
+#author Jinkai
+import os,sys,subprocess,time
+import re,getopt
+#import ipdb
+
+dbuser="root"
+dbpass="xx"
+repluser="repl"
+replpass="xx"
+
+str_input=""
+MYSQL="/app/program/mysql-5.6.27/bin/mysql"
+
+
+def get_dbs(dbhost,dbport,dbuser,dbpass):
+    comm1=MYSQL+ " -u"+dbuser+" -p"+dbpass+" -h"+dbhost+" -P"+dbport+" --skip-column-names --skip-line-numbers -e \"show databases;\" |grep -v \"+-\"|grep -v  information_schema |grep -v performance_schema|grep -v test"
+    print (comm1)
+    dbs_found=[]
+    p1=subprocess.Popen(comm1,shell=True,stdout=subprocess.PIPE)
+    p1.wait()
+    for line in p1.stdout:
+        dbs_found.append(line.strip('\n'))
+    print (dbs_found)
+    return dbs_found
+
+def dumpdb(dbhost,dbport,dbuser,dbpass):
+    """ dump src database fo file """
+    dumpcomm = "";
+    dtime=time.strftime("%Y%m%d%H%M%S", time.localtime())
+    dumpdir="./bks/bk_"+dbhost+"_"+dbport+"_"+dtime
+    dumpcomm="mydumper -u "+dbuser+" -p "+dbpass+" -h "+dbhost+" -P "+dbport+" -G -E -R -t 4 -o "+dumpdir
+    print (dumpcomm);
+    p1=subprocess.Popen(dumpcomm,shell=True,stdout=subprocess.PIPE)
+    p1.wait()
+    return dumpdir
+
+
+def getrecv_pos(metafile):
+    print ("metafile:"+metafile)
+    with open((os.path.join(metafile)), 'r') as f:
+        data = f.read()
+        strlist = data.split('\n')
+        logfile=strlist[2].split(":")[1].lstrip(" ")
+        logpos=strlist[3].split(":")[1].lstrip(" ")
+    print  "change master to master_log_file='"+ logfile+ "', master_log_pos="+logpos
+    return "change master to master_log_file='"+ logfile+ "', master_log_pos="+logpos
+
+def check_slave(dbhost,dbport,dbuser,dbpass):
+    """ to ensure the dst original slave is stopped."""
+    returnstr="";
+    checkslavecomm=MYSQL+" -u"+dbuser+" -p"+dbpass+" -h"+dbhost+" -P"+dbport+" -e 'show slave status\G'"
+
+    p1 = subprocess.Popen(checkslavecomm, shell=True, stdout=subprocess.PIPE)
+    p1.wait()
+    returnstr = "YES";
+    if(p1.stdout ==  ""):
+        return "NULL";
+    for line in p1.stdout:
+        if (re.search("Slave_IO_Running: No",line)):
+            returnstr="NO";
+            return returnstr;
+        elif (re.search("Slave_SQL_Running: No",line)):
+            returnstr="NO";
+            return returnstr;
+    print "--------------------------" + returnstr
+    return returnstr;
+
+def start_slave(srcdbhost,srcdbport,dbhost,dbport,dbuser,dbpass,repluser,replpass,dfile):
+    """ on dst , change master , start slave"""
+    if(check_slave(dbhost,dbport,dbuser,dbpass) == 'NO'):
+        changemastersql=""
+        changemastercomm=""
+        changemastersql=getrecv_pos(dfile + "/metadata")
+        changemastersql += ",master_host='"+srcdbhost+"',master_port="+srcdbport+",master_user='"+repluser+"',master_password='"+replpass+"';"
+        print changemastersql;
+        changemastercomm=MYSQL+" -u"+dbuser+" -p"+dbpass+" -h"+dbhost+" -P"+dbport+ " -e \""+changemastersql + "\""
+        print changemastercomm
+        p1 = subprocess.Popen(changemastercomm, shell=True, stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        p1.wait()
+        for line in p1.stdout:
+            line.strip('\n')
+        startslavecomm=MYSQL+" -u"+dbuser+" -p"+dbpass+" -h"+dbhost+" -P"+dbport+" -e 'start slave'"
+        p1 = subprocess.Popen(startslavecomm, shell=True, stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        p1.wait()
+        for line in p1.stdout:
+            print (line.strip('\n'))
+    else:
+        print("Dst slave is running or no slave! EXIT!");
+        exit(-3)
+
+def recover_db(dbhost,dbport,dbuser,dbpass,dfile):
+    """ load data into dst database """
+    if check_slave(dbhost,dbport,dbuser,dbpass) == 'NO':
+        recovercomm = "myloader -u " + dbuser + " -p " + dbpass + " -h " + dbhost + " -P " + dbport + " -e -o -t 10 -d " + dfile
+        print(recovercomm)
+        p1=subprocess.Popen(recovercomm,shell=True,stdout=subprocess.PIPE)
+        p1.wait()
+    else:
+        print ("Destination "+dbhost+":"+dbport+" slave is running! Or no slave");
+        exit(-3)
+
+def main(argv):
+    arg_srcdbhost = "";
+    arg_srcdbport = "";
+    arg_dstdbhost = "";
+    arg_dstdbport = "";
+    str_input =  "";
+
+    try:
+        opts, args = getopt.getopt(argv, "ha:b:c:d:", ["srcdbhost=", "srcdbport=", "dstdbhost=", "dstdbport"])
+    except getopt.GetoptError:
+        print('program.py -a <srcdbhost> -b <srcdbport> -c <dstdbhost> -d <dstport>')
+        sys.exit(2)
+    for opt, arg in opts:
+        if opt == '-h':
+            print('program.py -a <srcdbhost> -b <srcdbport> -c <dstdbhost> -d <dstport>')
+            sys.exit()
+        elif opt in ("-a", "--srcdbhost"):
+            arg_srcdbhost = arg
+        elif opt in ("-b", "--srcdbport"):
+            arg_srcdbport = arg
+        elif opt in ("-c", "--dstdbhost"):
+            arg_dstdbhost = arg
+        elif opt in ("-d", "--dstdbport"):
+            arg_dstdbport = arg
+    print ("inputed DB is:", arg_srcdbhost, arg_srcdbport,  arg_dstdbhost, arg_dstdbport)
+
+
+    dumpfile = dumpdb(arg_srcdbhost, arg_srcdbport, dbuser, dbpass);
+    recover_db(arg_dstdbhost, arg_dstdbport, dbuser, dbpass, dumpfile);
+    print("wheather to start dst slave (Y/N): %s" % str_input)
+    str_input = raw_input()
+    if str_input.upper() == 'Y' or str_input.upper() == 'YES':
+        start_slave(arg_srcdbhost,arg_srcdbport,arg_dstdbhost, arg_dstdbport, dbuser, dbpass,repluser,replpass,dumpfile);
+    else:
+        print("Don't start dst slave!")
+
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
